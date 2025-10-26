@@ -1,0 +1,1161 @@
+## Backend: `backend/src/main/java/com/devjourneyhub/ecommerce`
+
+### EcommerceMiniApplication.java
+```java
+package com.devjourneyhub.ecommerce;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class EcommerceMiniApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(EcommerceMiniApplication.class, args);
+    }
+}
+```
+
+### config/SecurityConfig.java
+```java
+package com.devjourneyhub.ecommerce.config;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.List;
+
+/**
+ * Spring Security configuration: stateless JWT-based auth.
+ */
+@Configuration
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtAuthFilter jwtAuthFilter;
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+                .csrf(AbstractHttpConfigurer::disable)
+                .cors(cors -> cors.configurationSource(corsConfigurationSource())) // ✅ Thêm dòng này
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers("/api/auth/**").permitAll()
+                        .requestMatchers("/api/products/**", "/api/categories/**").permitAll()
+                        .anyRequest().authenticated()
+                )
+                .sessionManagement(sess -> sess.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+
+    // ✅ Cấu hình CORS (cho phép React frontend truy cập)
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.setAllowedOrigins(List.of("http://localhost:5173")); // cho phép frontend
+        config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+        config.setAllowedHeaders(List.of("*"));
+        config.setAllowCredentials(true); // cho phép gửi cookie/token
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return source;
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
+        return config.getAuthenticationManager();
+    }
+}
+```
+
+### config/JwtAuthFilter.java
+```java
+package com.devjourneyhub.ecommerce.config;
+
+import com.devjourneyhub.ecommerce.util.JwtUtils;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.lang.NonNull;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+
+/**
+ * Filter that reads Authorization: Bearer <token> header,
+ * validates JWT and sets authentication in SecurityContext.
+ */
+@Component
+@RequiredArgsConstructor
+public class JwtAuthFilter extends OncePerRequestFilter {
+
+    private final JwtUtils jwtUtils;
+    private final UserDetailsService userDetailsService; // used to load user details
+
+    @Override
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain chain
+    ) throws ServletException, IOException {
+
+        final String authHeader = request.getHeader("Authorization");
+        final String token;
+        final String username;
+
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            chain.doFilter(request, response);
+            return;
+        }
+
+        token = authHeader.substring(7);
+        username = jwtUtils.extractUsername(token);
+
+        // If username present and no authentication yet, validate token and set auth
+        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+            if (jwtUtils.validateToken(token, userDetails)) {
+                UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                        userDetails, null, userDetails.getAuthorities());
+                authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                SecurityContextHolder.getContext().setAuthentication(authToken);
+            }
+        }
+
+        chain.doFilter(request, response);
+    }
+}
+```
+
+### util/JwtUtils.java
+```java
+package com.devjourneyhub.ecommerce.util;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.SignatureAlgorithm;
+import io.jsonwebtoken.io.Decoders;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.stereotype.Component;
+
+import java.security.Key;
+import java.util.Date;
+import java.util.function.Function;
+
+/**
+ * Helper to generate/validate JWT tokens.
+ * NOTE: In production, the SECRET must come from environment variable or secrets manager.
+ */
+@Component
+public class JwtUtils {
+
+    // 256-bit key in base64 (example). Replace in real app.
+    private static final String SECRET = "dGhpc19pc19hX3JlYWxseV9sb25nX3NlY3JldF9rZXlfc3RyaW5n"; // base64
+
+    private Key getSigningKey() {
+        byte[] keyBytes = Decoders.BASE64.decode(SECRET);
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
+
+    public String generateToken(UserDetails userDetails) {
+        return Jwts.builder()
+                .setSubject(userDetails.getUsername())
+                .setIssuedAt(new Date(System.currentTimeMillis()))
+                .setExpiration(new Date(System.currentTimeMillis() + 1000 * 60 * 60 * 24)) // 24h
+                .signWith(getSigningKey(), SignatureAlgorithm.HS256)
+                .compact();
+    }
+
+    public String extractUsername(String token) {
+        return extractClaim(token, Claims::getSubject);
+    }
+
+    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
+        final Claims claims = Jwts.parserBuilder().setSigningKey(getSigningKey()).build().parseClaimsJws(token).getBody();
+        return claimsResolver.apply(claims);
+    }
+
+    public boolean validateToken(String token, UserDetails userDetails) {
+        final String username = extractUsername(token);
+        return (username.equals(userDetails.getUsername()) && !isTokenExpired(token));
+    }
+
+    private boolean isTokenExpired(String token) {
+        return extractClaim(token, Claims::getExpiration).before(new Date());
+    }
+}
+```
+
+### dto/AuthRequest.java
+```java
+package com.devjourneyhub.ecommerce.dto;
+
+import lombok.Data;
+
+/**
+ * DTO received from client when logging in.
+ */
+@Data
+public class AuthRequest {
+    private String username; // or email depending on your user model
+    private String password;
+}
+```
+
+### dto/RegisterRequest.java
+```java
+package com.devjourneyhub.ecommerce.dto;
+
+import lombok.Data;
+
+@Data
+public class RegisterRequest {
+    private String username;
+    private String password;
+}
+```
+
+### dto/AuthResponse.java
+```java
+package com.devjourneyhub.ecommerce.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+
+@Data
+@AllArgsConstructor
+public class AuthResponse {
+    private String token; // returned JWT token
+}
+```
+
+### dto/ProductDto.java
+```java
+package com.devjourneyhub.ecommerce.dto;
+
+import lombok.Data;
+
+@Data
+public class ProductDto {
+    private Long id;
+    private String name;
+    private String description;
+    private Double price;
+    private String imageUrl;
+    private Long categoryId;
+
+    // Factory helpers can be added in service to map between entity and dto
+}
+```
+
+### dto/CategoryDto.java
+```java
+package com.devjourneyhub.ecommerce.dto;
+
+import lombok.Data;
+
+@Data
+public class CategoryDto {
+    private Long id;
+    private String name;
+}
+```
+
+### entity/Role.java
+```java
+package com.devjourneyhub.ecommerce.entity;
+
+public enum Role {
+    USER, ADMIN
+}
+```
+
+### entity/User.java
+```java
+package com.devjourneyhub.ecommerce.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+/**
+ * Basic user entity. For simplicity we implement UserDetails in a custom adapter rather than directly here.
+ */
+@Entity
+@Table(name = "users")
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(unique = true, nullable = false)
+    private String username;
+
+    @Column(nullable = false)
+    private String password;
+
+    @Enumerated(EnumType.STRING)
+    private Role role;
+}
+```
+
+### entity/Category.java
+```java
+package com.devjourneyhub.ecommerce.entity;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import java.util.List;
+
+@Entity
+@Table(name = "categories")
+@Data
+public class Category {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String name;
+
+    // One-to-many mapped by product.category
+    @OneToMany(mappedBy = "category", cascade = CascadeType.ALL)
+    private List<Product> products;
+}
+```
+
+### entity/Product.java
+```java
+package com.devjourneyhub.ecommerce.entity;
+
+import jakarta.persistence.*;
+import lombok.Data;
+
+@Entity
+@Table(name = "products")
+@Data
+public class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String name;
+    private String description;
+    private Double price;
+    private String imageUrl;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "category_id")
+    private Category category;
+
+    public Product() {}
+
+    public Product(String name, Double price, String imageUrl, Category category) {
+        this.name = name;
+        this.price = price;
+        this.imageUrl = imageUrl;
+        this.category = category;
+    }
+}
+```
+
+### exception/ResourceNotFoundException.java
+```java
+package com.devjourneyhub.ecommerce.exception;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
+
+@ResponseStatus(HttpStatus.NOT_FOUND)
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) { super(message); }
+}
+```
+
+### repository/UserRepository.java
+```java
+package com.devjourneyhub.ecommerce.repository;
+
+import com.devjourneyhub.ecommerce.entity.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Optional;
+
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByUsername(String username);
+}
+```
+
+### repository/ProductRepository.java
+```java
+package com.devjourneyhub.ecommerce.repository;
+
+import com.devjourneyhub.ecommerce.entity.Product;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface ProductRepository extends JpaRepository<Product, Long> { }
+```
+
+### repository/CategoryRepository.java
+```java
+package com.devjourneyhub.ecommerce.repository;
+
+import com.devjourneyhub.ecommerce.entity.Category;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface CategoryRepository extends JpaRepository<Category, Long> { }
+```
+
+### service/AuthService.java
+```java
+package com.devjourneyhub.ecommerce.service;
+
+import com.devjourneyhub.ecommerce.dto.AuthRequest;
+import com.devjourneyhub.ecommerce.dto.AuthResponse;
+import com.devjourneyhub.ecommerce.dto.RegisterRequest;
+
+public interface AuthService {
+    AuthResponse register(RegisterRequest request);
+    AuthResponse login(AuthRequest request);
+}
+```
+
+### service/impl/AuthServiceImpl.java
+```java
+package com.devjourneyhub.ecommerce.service.impl;
+
+import com.devjourneyhub.ecommerce.dto.AuthRequest;
+import com.devjourneyhub.ecommerce.dto.AuthResponse;
+import com.devjourneyhub.ecommerce.dto.RegisterRequest;
+import com.devjourneyhub.ecommerce.entity.Role;
+import com.devjourneyhub.ecommerce.entity.User;
+import com.devjourneyhub.ecommerce.repository.UserRepository;
+import com.devjourneyhub.ecommerce.service.AuthService;
+import com.devjourneyhub.ecommerce.util.JwtUtils;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+
+@Service
+@RequiredArgsConstructor
+public class AuthServiceImpl implements AuthService {
+
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+    private final JwtUtils jwtUtils;
+    private final AuthenticationManager authenticationManager;
+    private final UserDetailsService userDetailsService;
+
+    @Override
+    public AuthResponse register(RegisterRequest request) {
+        // avoid duplicate username
+        if (userRepository.findByUsername(request.getUsername()).isPresent()) {
+            throw new RuntimeException("Username already taken");
+        }
+
+        User user = User.builder()
+                .username(request.getUsername())
+                .password(passwordEncoder.encode(request.getPassword()))
+                .role(Role.USER)
+                .build();
+
+        userRepository.save(user);
+
+        UserDetails ud = userDetailsService.loadUserByUsername(user.getUsername());
+        String token = jwtUtils.generateToken(ud);
+        return new AuthResponse(token);
+    }
+
+    @Override
+    public AuthResponse login(AuthRequest request) {
+        try {
+            // Attempt authentication (this will throw if credentials invalid)
+            authenticationManager.authenticate(
+                    new UsernamePasswordAuthenticationToken(request.getUsername(), request.getPassword())
+            );
+        } catch (AuthenticationException ex) {
+            throw new RuntimeException("Invalid credentials");
+        }
+
+        UserDetails ud = userDetailsService.loadUserByUsername(request.getUsername());
+        String token = jwtUtils.generateToken(ud);
+        return new AuthResponse(token);
+    }
+}
+```
+
+### service/ProductService.java
+```java
+package com.devjourneyhub.ecommerce.service;
+
+import com.devjourneyhub.ecommerce.dto.ProductDto;
+
+import java.util.List;
+
+public interface ProductService {
+    List<ProductDto> getAllProducts();
+    ProductDto createProduct(ProductDto dto);
+    ProductDto updateProduct(Long id, ProductDto dto);
+    void deleteProduct(Long id);
+}
+```
+
+### service/impl/ProductServiceImpl.java
+```java
+package com.devjourneyhub.ecommerce.service.impl;
+
+import com.devjourneyhub.ecommerce.dto.ProductDto;
+import com.devjourneyhub.ecommerce.entity.Category;
+import com.devjourneyhub.ecommerce.entity.Product;
+import com.devjourneyhub.ecommerce.exception.ResourceNotFoundException;
+import com.devjourneyhub.ecommerce.repository.CategoryRepository;
+import com.devjourneyhub.ecommerce.repository.ProductRepository;
+import com.devjourneyhub.ecommerce.service.ProductService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+public class ProductServiceImpl implements ProductService {
+
+    private final ProductRepository productRepository;
+    private final CategoryRepository categoryRepository;
+
+    @Override
+    public List<ProductDto> getAllProducts() {
+        return productRepository.findAll().stream().map(this::toDto).collect(Collectors.toList());
+    }
+
+    @Override
+    public ProductDto createProduct(ProductDto dto) {
+        Category cat = categoryRepository.findById(dto.getCategoryId())
+                .orElseThrow(() -> new ResourceNotFoundException("Category not found"));
+
+        Product p = new Product(dto.getName(), dto.getPrice(), dto.getImageUrl(), cat);
+        Product saved = productRepository.save(p);
+        return toDto(saved);
+    }
+
+    @Override
+    public ProductDto updateProduct(Long id, ProductDto dto) {
+        Product existing = productRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Product not found"));
+
+        existing.setName(dto.getName() != null ? dto.getName() : existing.getName());
+        existing.setDescription(dto.getDescription() != null ? dto.getDescription() : existing.getDescription());
+        existing.setPrice(dto.getPrice() != null ? dto.getPrice() : existing.getPrice());
+        existing.setImageUrl(dto.getImageUrl() != null ? dto.getImageUrl() : existing.getImageUrl());
+
+        if (dto.getCategoryId() != null) {
+            Category cat = categoryRepository.findById(dto.getCategoryId())
+                    .orElseThrow(() -> new ResourceNotFoundException("Category not found"));
+            existing.setCategory(cat);
+        }
+
+        Product saved = productRepository.save(existing);
+        return toDto(saved);
+    }
+
+    @Override
+    public void deleteProduct(Long id) {
+        if (!productRepository.existsById(id)) {
+            throw new ResourceNotFoundException("Product not found");
+        }
+        productRepository.deleteById(id);
+    }
+
+    private ProductDto toDto(Product p) {
+        ProductDto dto = new ProductDto();
+        dto.setId(p.getId());
+        dto.setName(p.getName());
+        dto.setDescription(p.getDescription());
+        dto.setPrice(p.getPrice());
+        dto.setImageUrl(p.getImageUrl());
+        dto.setCategoryId(p.getCategory() != null ? p.getCategory().getId() : null);
+        return dto;
+    }
+}
+```
+
+### service/CategoryService.java
+```java
+package com.devjourneyhub.ecommerce.service;
+
+import com.devjourneyhub.ecommerce.dto.CategoryDto;
+
+import java.util.List;
+
+public interface CategoryService {
+    List<CategoryDto> getAll();
+    CategoryDto create(CategoryDto dto);
+    CategoryDto update(Long id, CategoryDto dto);
+    void delete(Long id);
+}
+```
+
+### service/impl/CategoryServiceImpl.java
+```java
+package com.devjourneyhub.ecommerce.service.impl;
+
+import com.devjourneyhub.ecommerce.dto.CategoryDto;
+import com.devjourneyhub.ecommerce.entity.Category;
+import com.devjourneyhub.ecommerce.exception.ResourceNotFoundException;
+import com.devjourneyhub.ecommerce.repository.CategoryRepository;
+import com.devjourneyhub.ecommerce.service.CategoryService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+public class CategoryServiceImpl implements CategoryService {
+
+    private final CategoryRepository categoryRepository;
+
+    @Override
+    public List<CategoryDto> getAll() {
+        return categoryRepository.findAll().stream().map(this::toDto).collect(Collectors.toList());
+    }
+
+    @Override
+    public CategoryDto create(CategoryDto dto) {
+        Category c = new Category();
+        c.setName(dto.getName());
+        Category saved = categoryRepository.save(c);
+        return toDto(saved);
+    }
+
+    @Override
+    public CategoryDto update(Long id, CategoryDto dto) {
+        Category existing = categoryRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Category not found"));
+        existing.setName(dto.getName() != null ? dto.getName() : existing.getName());
+        Category saved = categoryRepository.save(existing);
+        return toDto(saved);
+    }
+
+    @Override
+    public void delete(Long id) {
+        if (!categoryRepository.existsById(id)) throw new ResourceNotFoundException("Category not found");
+        categoryRepository.deleteById(id);
+    }
+
+    private CategoryDto toDto(Category c) {
+        CategoryDto dto = new CategoryDto();
+        dto.setId(c.getId());
+        dto.setName(c.getName());
+        return dto;
+    }
+}
+```
+
+### service/CustomUserDetailsService.java
+```java
+package com.devjourneyhub.ecommerce.service;
+
+import com.devjourneyhub.ecommerce.entity.User;
+import com.devjourneyhub.ecommerce.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.stereotype.Service;
+
+@Service
+@RequiredArgsConstructor
+public class CustomUserDetailsService implements UserDetailsService {
+
+    private final UserRepository userRepository;
+
+    @Override
+    public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new UsernameNotFoundException("User not found: " + username));
+
+        // Convert User entity → Spring Security UserDetails
+        return org.springframework.security.core.userdetails.User
+                .withUsername(user.getUsername())
+                .password(user.getPassword()) // password đã mã hóa
+                .roles(user.getRole().name())  // ADMIN / USER
+                .build();
+    }
+}
+```
+
+### controller/AuthController.java
+```java
+package com.devjourneyhub.ecommerce.controller;
+
+import com.devjourneyhub.ecommerce.dto.AuthRequest;
+import com.devjourneyhub.ecommerce.dto.AuthResponse;
+import com.devjourneyhub.ecommerce.dto.RegisterRequest;
+import com.devjourneyhub.ecommerce.service.AuthService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private final AuthService authService;
+
+    @PostMapping("/register")
+    public ResponseEntity<AuthResponse> register(@RequestBody RegisterRequest request) {
+        return ResponseEntity.ok(authService.register(request));
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<AuthResponse> login(@RequestBody AuthRequest request) {
+        return ResponseEntity.ok(authService.login(request));
+    }
+}
+```
+
+### controller/ProductController.java
+```java
+package com.devjourneyhub.ecommerce.controller;
+
+import com.devjourneyhub.ecommerce.dto.ProductDto;
+import com.devjourneyhub.ecommerce.service.ProductService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/products")
+@RequiredArgsConstructor
+public class ProductController {
+    private final ProductService productService;
+
+    @GetMapping
+    public ResponseEntity<List<ProductDto>> getAll() {
+        return ResponseEntity.ok(productService.getAllProducts());
+    }
+
+    @PostMapping
+    public ResponseEntity<ProductDto> create(@RequestBody ProductDto dto) {
+        return ResponseEntity.ok(productService.createProduct(dto));
+    }
+
+    @PutMapping("/{id}")
+    public ResponseEntity<ProductDto> update(@PathVariable Long id, @RequestBody ProductDto dto) {
+        return ResponseEntity.ok(productService.updateProduct(id, dto));
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> delete(@PathVariable Long id) {
+        productService.deleteProduct(id);
+        return ResponseEntity.noContent().build();
+    }
+}
+```
+
+### controller/CategoryController.java
+```java
+package com.devjourneyhub.ecommerce.controller;
+
+import com.devjourneyhub.ecommerce.dto.CategoryDto;
+import com.devjourneyhub.ecommerce.service.CategoryService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/categories")
+@RequiredArgsConstructor
+public class CategoryController {
+    private final CategoryService categoryService;
+
+    @GetMapping
+    public ResponseEntity<List<CategoryDto>> getAll() {
+        return ResponseEntity.ok(categoryService.getAll());
+    }
+
+    @PostMapping
+    public ResponseEntity<CategoryDto> create(@RequestBody CategoryDto dto) {
+        return ResponseEntity.ok(categoryService.create(dto));
+    }
+
+    @PutMapping("/{id}")
+    public ResponseEntity<CategoryDto> update(@PathVariable Long id, @RequestBody CategoryDto dto) {
+        return ResponseEntity.ok(categoryService.update(id, dto));
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> delete(@PathVariable Long id) {
+        categoryService.delete(id);
+        return ResponseEntity.noContent().build();
+    }
+}
+```
+
+### build.gradle.kts
+```kotlin
+plugins {
+	java
+	id("org.springframework.boot") version "3.5.6"
+	id("io.spring.dependency-management") version "1.1.7"
+}
+
+group = "com.devjourneyhub"
+version = "0.0.1-SNAPSHOT"
+description = "Mini E-Commerce backend (Spring Boot + JWT + MySQL)"
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+}
+
+configurations {
+	compileOnly {
+		extendsFrom(configurations.annotationProcessor.get())
+	}
+}
+
+repositories {
+	mavenCentral()
+}
+
+dependencies {
+	implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+	implementation("org.springframework.boot:spring-boot-starter-security")
+	implementation("org.springframework.boot:spring-boot-starter-validation")
+	implementation("org.springframework.boot:spring-boot-starter-web")
+	compileOnly("org.projectlombok:lombok")
+	developmentOnly("org.springframework.boot:spring-boot-devtools")
+	runtimeOnly("com.mysql:mysql-connector-j")
+	annotationProcessor("org.projectlombok:lombok")
+	testImplementation("org.springframework.boot:spring-boot-starter-test")
+	testImplementation("org.springframework.security:spring-security-test")
+	testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+
+    implementation("io.jsonwebtoken:jjwt-api:0.11.5")
+    runtimeOnly("io.jsonwebtoken:jjwt-impl:0.11.5")
+    runtimeOnly("io.jsonwebtoken:jjwt-jackson:0.11.5")
+}
+
+tasks.withType<Test> {
+	useJUnitPlatform()
+}
+
+
+```
+
+---
+
+## Frontend: `frontend/src`
+
+### services/apiClient.ts
+```ts
+import axios from 'axios';
+
+const apiClient = axios.create({
+    baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080/api',
+    headers: { 'Content-Type': 'application/json' }
+});
+
+// Interceptor: attach token from localStorage if present
+apiClient.interceptors.request.use(config => {
+    const token = localStorage.getItem('token');
+    if (token) {
+        config.headers = config.headers || {};
+        config.headers['Authorization'] = `Bearer ${token}`;
+    }
+    return config;
+});
+
+export default apiClient;
+```
+
+### types/category.ts
+```ts
+export interface Category {
+    id: number;
+    name: string;
+}
+```
+
+### types/product.ts
+```ts
+export interface Product {
+  id: number;
+  name: string;
+  description?: string;
+  price: number;
+  imageUrl?: string;
+  categoryId?: number;
+}
+```
+
+### components/ProductCard.tsx
+```tsx
+import type { Product } from '../types/product';
+
+export default function ProductCard({ product }: { product: Product }) {
+    return (
+        <div className="border rounded-lg shadow p-3 hover:shadow-lg transition">
+            <img src={product.imageUrl || 'https://picsum.photos/200'} alt={product.name} className="w-full h-40 object-cover rounded" />
+            <h3 className="text-lg font-semibold mt-2">{product.name}</h3>
+            <p className="text-gray-600">${product.price}</p>
+        </div>
+    );
+}
+```
+
+### components/ProductGrid.tsx
+```tsx
+import { useEffect, useState } from 'react';
+import apiClient from '../services/apiClient';
+import ProductCard from './ProductCard';
+import type { Product } from '../types/product';
+
+export default function ProductGrid() {
+  const [products, setProducts] = useState<Product[]>([]);
+
+  useEffect(() => {
+    apiClient.get('/products')
+      .then(res => setProducts(res.data))
+      .catch(err => console.error('Fetch products failed', err));
+  }, []);
+
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 p-4">
+      {products.map(p => <ProductCard key={p.id} product={p} />)}
+    </div>
+  );
+}
+```
+
+### components/CategoryFilter.tsx
+```tsx
+import { useEffect, useState } from 'react';
+import apiClient from '../services/apiClient';
+
+export default function CategoryFilter({ onSelect }: { onSelect?: (id?: number) => void }) {
+    const [cats, setCats] = useState<{ id: number; name: string }[]>([]);
+
+    useEffect(() => {
+        apiClient.get('/categories').then(res => setCats(res.data)).catch(() => setCats([]));
+    }, []);
+
+    return (
+        <div className="flex gap-2 p-4">
+            <button className="px-3 py-1 bg-gray-200 rounded" onClick={() => onSelect?.(undefined)}>All</button>
+            {cats.map(c => (
+                <button key={c.id} className="px-3 py-1 bg-gray-100 rounded" onClick={() => onSelect?.(c.id)}>{c.name}</button>
+            ))}
+        </div>
+    );
+}
+```
+
+### pages/LoginPage.tsx
+```tsx
+import React, { useState } from 'react';
+import apiClient from '../services/apiClient';
+
+export default function LoginPage() {
+    const [username, setUsername] = useState('');
+    const [password, setPassword] = useState('');
+
+    const submit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        try {
+            const res = await apiClient.post('/auth/login', { username, password });
+            const token = res.data.token || res.data.data?.token; // support wrappers
+            localStorage.setItem('token', token);
+            window.location.href = '/';
+        } catch (err) {
+            console.error(err);
+            alert('Login failed');
+        }
+    }
+
+    return (
+        <div className="flex items-center justify-center h-screen">
+            <form onSubmit={submit} className="w-80 p-6 bg-white rounded shadow">
+                <h2 className="text-xl mb-4">Login</h2>
+                <input value={username} onChange={e => setUsername(e.target.value)} placeholder="username" className="w-full p-2 border mb-3" />
+                <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="password" className="w-full p-2 border mb-4" />
+                <button className="w-full bg-blue-500 text-white py-2 rounded">Login</button>
+            </form>
+        </div>
+    );
+}
+```
+
+### pages/RegisterPage.tsx
+```tsx
+import React, { useState } from 'react';
+import apiClient from '../services/apiClient';
+
+export default function RegisterPage() {
+    const [username, setUsername] = useState('');
+    const [password, setPassword] = useState('');
+
+    const submit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        try {
+            await apiClient.post('/auth/register', { username, password });
+            alert('Registered — please login');
+            window.location.href = '/login';
+        } catch (err) {
+            console.error(err);
+            alert('Register failed');
+        }
+    }
+
+    return (
+        <div className="flex items-center justify-center h-screen">
+            <form onSubmit={submit} className="w-80 p-6 bg-white rounded shadow">
+                <h2 className="text-xl mb-4">Register</h2>
+                <input value={username} onChange={e => setUsername(e.target.value)} placeholder="username" className="w-full p-2 border mb-3" />
+                <input value={password} onChange={e => setPassword(e.target.value)} type="password" placeholder="password" className="w-full p-2 border mb-4" />
+                <button className="w-full bg-green-500 text-white py-2 rounded">Register</button>
+            </form>
+        </div>
+    );
+}
+```
+
+### pages/HomePage.tsx
+```tsx
+import ProductGrid from '../components/ProductGrid';
+
+export default function HomePage() {
+    return (
+        <div>
+            <h1 className="text-2xl font-bold p-4">Products</h1>
+            <ProductGrid />
+        </div>
+    );
+}
+```
+
+### App.tsx
+```tsx
+import { BrowserRouter, Routes, Route, Link } from 'react-router-dom';
+import HomePage from './pages/HomePage';
+import LoginPage from './pages/LoginPage';
+import RegisterPage from './pages/RegisterPage';
+
+export default function App() {
+    return (
+        <BrowserRouter>
+            <nav className="p-4 bg-white shadow flex gap-4">
+                <Link to="/">Home</Link>
+                <Link to="/login">Login</Link>
+                <Link to="/register">Register</Link>
+            </nav>
+
+            <Routes>
+                <Route path="/" element={<HomePage />} />
+                <Route path="/login" element={<LoginPage />} />
+                <Route path="/register" element={<RegisterPage />} />
+            </Routes>
+        </BrowserRouter>
+    );
+}
+```
+
+### main.tsx
+```tsx
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(<App />);
+```
+
+### index.css
+```css
+@import "tailwindcss";
+
+body { background: #f7fafc; }
+```
+
+### package.json (frontend minimal)
+```json
+{
+  "name": "ecommerce-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.1.16",
+    "axios": "^1.12.2",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "react-router-dom": "^7.9.4",
+    "tailwindcss": "^4.1.16"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.36.0",
+    "@types/node": "^24.6.0",
+    "@types/react": "^19.1.16",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.4",
+    "eslint": "^9.36.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.22",
+    "globals": "^16.4.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.45.0",
+    "vite": "^7.1.7"
+  }
+}
+```
